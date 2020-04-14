@@ -1,21 +1,23 @@
 use crate::ancestors::Ancestors;
+use crate::logger::Log;
 use crate::map::Map;
 use crate::node::{Node, UnsafeNode};
 use crate::tree::Tree;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use std::ffi::c_void;
 use std::hash::Hash;
 use std::marker::PhantomData as marker;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 
 /// The inner contents of a node.
-pub(crate) struct NodeInner<K, V> {
+pub(crate) struct NodeInner<K, V, Logger> {
     value: V,
-    marker: marker<K>,
-    ancestors: Option<Ancestors<K, V>>,
+    marker: marker<(K, Logger)>,
+    ancestors: Option<Ancestors<K, V, Logger>>,
     /// The children of this node. Children remove themselves from this map
     /// on drop either after the free list is gone or when the tree is GC'd.
-    children: RwLock<Map<K, UnsafeNode<K, V>>>,
+    children: RwLock<Map<K, UnsafeNode<K, V, Logger>>>,
     /// The reference counter of this node. Starts at 1, is reincremented back
     /// to 1 after reaching 0 if it is put on the free list.
     refcount: AtomicUsize,
@@ -35,7 +37,7 @@ pub(crate) struct NodeInner<K, V> {
     ///
     /// Starts as `NodeInner::DANGLING_PTR` for root nodes and the null pointer
     /// for non-root nodes.
-    next_free: AtomicPtr<NodeInner<K, V>>,
+    next_free: AtomicPtr<NodeInner<K, V, Logger>>,
     /// The length of the free list. Only used on root nodes.
     free_count: AtomicUsize,
 }
@@ -54,7 +56,22 @@ where
     /// Note that the root value is never going to be accessed by either the
     /// crate or the caller.
     pub fn new(root: V) -> Self {
-        unsafe {
+        Self::with_logger(root)
+    }
+}
+
+impl<K, V, Logger> Tree<K, V, Logger>
+where
+    K: Eq + Hash,
+    for<'a> &'a V: Into<K>,
+    Logger: Log,
+{
+    /// Creates a new tree from a root value.
+    ///
+    /// Note that the root value is never going to be accessed by either the
+    /// crate or the caller.
+    pub fn with_logger(root: V) -> Self {
+        let tree = unsafe {
             Tree::from_root_node(Node::from_unsafe_node(UnsafeNode::new(NodeInner {
                 value: root,
                 marker,
@@ -64,9 +81,18 @@ where
                 next_free: AtomicPtr::new(NodeInner::DANGLING_PTR),
                 free_count: Default::default(),
             })))
-        }
+        };
+        Logger::log_new(&**tree.as_unsafe_node() as *const NodeInner<K, V, Logger> as *const c_void);
+        tree
     }
+}
 
+impl<K, V, Logger> Tree<K, V, Logger>
+where
+    K: Eq + Hash,
+    for<'a> &'a V: Into<K>,
+    Logger: Log,
+{
     /// Runs the garbage collector of the tree's free list if needed according
     /// to some heuristics.
     pub fn maybe_gc(&self) {
@@ -84,7 +110,7 @@ where
     /// the free list, taking care of not swapping any pointer with its lowest
     /// bit set, given that would break the lock currently held by another
     /// thread.
-    unsafe fn swap_free_list_and_gc(&self, ptr: *mut NodeInner<K, V>) {
+    unsafe fn swap_free_list_and_gc(&self, ptr: *mut NodeInner<K, V, Logger>) {
         let root = self.as_unsafe_node();
         let mut head = root.next_free.load(Ordering::Relaxed);
         loop {
@@ -102,7 +128,7 @@ where
             // Unmask the lock bit from the current head, this is the most
             // probable value `compare_exchange_weak` will read when the other
             // thread currently locking the free list unlocks it.
-            head = (head as usize & !1) as *mut NodeInner<K, V>;
+            head = (head as usize & !1) as *mut NodeInner<K, V, Logger>;
             // This could fail if the free list head is
             // `NodeInner::DANGLING_PTR` with the lowest bit set, which
             // makes no sense.
@@ -140,26 +166,28 @@ where
     }
 }
 
-impl<K, V> Drop for Tree<K, V>
+impl<K, V, Logger> Drop for Tree<K, V, Logger>
 where
     K: Eq + Hash,
     for<'a> &'a V: Into<K>,
+    Logger: Log,
 {
     fn drop(&mut self) {
         unsafe { self.swap_free_list_and_gc(ptr::null_mut()) }
     }
 }
 
-impl<K, V> Node<K, V>
+impl<K, V, Logger> Node<K, V, Logger>
 where
     K: Eq + Hash,
     for<'a> &'a V: Into<K>,
+    Logger: Log,
 {
     /// Ensures that a child exists in this node with the given value.
     ///
     /// If a child with this value was already created since last GC happened,
     /// that child is returned instead.
-    pub fn ensure_child(&self, value: V) -> Node<K, V> {
+    pub fn ensure_child(&self, value: V) -> Node<K, V, Logger> {
         let this = self.as_unsafe_node();
         let children = this.children.upgradable_read();
         let key = (&value).into();
@@ -177,7 +205,9 @@ where
                 //
                 // To avoid that, we try to push the child on the free list
                 // ourselves.
-                unsafe { UnsafeNode::push_on_free_list(child); }
+                unsafe {
+                    UnsafeNode::push_on_free_list(child);
+                }
             }
             return unsafe { Node::from_unsafe_node(UnsafeNode::clone(child)) };
         }
@@ -198,14 +228,17 @@ where
                 })
             },
         );
-        unsafe { Node::from_unsafe_node(UnsafeNode::clone(unsafe_node)) }
+        let node = unsafe { Node::from_unsafe_node(UnsafeNode::clone(unsafe_node)) };
+        Logger::log_new(&**node.as_unsafe_node() as *const NodeInner<K, V, Logger> as *const c_void);
+        node
     }
 }
 
-impl<K, V> Clone for Node<K, V>
+impl<K, V, Logger> Clone for Node<K, V, Logger>
 where
     K: Eq + Hash,
     for<'a> &'a V: Into<K>,
+    Logger: Log,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -215,10 +248,11 @@ where
     }
 }
 
-impl<K, V> UnsafeNode<K, V>
+impl<K, V, Logger> UnsafeNode<K, V, Logger>
 where
     K: Eq + Hash,
     for<'a> &'a V: Into<K>,
+    Logger: Log,
 {
     unsafe fn drop_without_free_list(this: &mut Self) {
         let mut this = UnsafeNode::clone(this);
@@ -248,6 +282,7 @@ where
                     .take()
                     .map(Ancestors::into_parent)
             };
+            Logger::log_drop(&*this as *const NodeInner<K, V, Logger> as *const c_void);
             UnsafeNode::drop(&mut this);
             if let Some(parent) = parent {
                 this = parent.into_unsafe_node();
@@ -269,8 +304,8 @@ where
     unsafe fn push_on_free_list(this: &Self) -> bool {
         let root = this.root().unwrap();
         let mut old_head = root.next_free.load(Ordering::Relaxed);
-        let this_ptr = &**this as *const NodeInner<K, V> as *mut NodeInner<K, V>;
-        let this_lock = (this_ptr as usize | 1) as *mut NodeInner<K, V>;
+        let this_ptr = &**this as *const NodeInner<K, V, Logger> as *mut NodeInner<K, V, Logger>;
+        let this_lock = (this_ptr as usize | 1) as *mut NodeInner<K, V, Logger>;
         loop {
             if old_head.is_null() {
                 // Tree was dropped and free list has been destroyed.
@@ -279,7 +314,7 @@ where
             // Unmask the lock bit from the current head, this is the most
             // probable value `compare_exchange_weak` will read when the other
             // thread currently locking the free list unlocks it.
-            old_head = (old_head as usize & !1) as *mut NodeInner<K, V>;
+            old_head = (old_head as usize & !1) as *mut NodeInner<K, V, Logger>;
             if old_head == this_ptr {
                 // The free list is currently locked or has finished being
                 // locked to put this very node at the head of the free list,
@@ -321,10 +356,11 @@ where
     }
 }
 
-impl<K, V> Drop for Node<K, V>
+impl<K, V, Logger> Drop for Node<K, V, Logger>
 where
     K: Eq + Hash,
     for<'a> &'a V: Into<K>,
+    Logger: Log,
 {
     fn drop(&mut self) {
         let this = self.as_unsafe_node();
@@ -342,7 +378,7 @@ where
     }
 }
 
-impl<K, V> NodeInner<K, V>
+impl<K, V, Logger> NodeInner<K, V, Logger>
 where
     for<'a> &'a V: Into<K>,
 {
@@ -351,10 +387,10 @@ where
     }
 }
 
-impl<K, V> NodeInner<K, V> {
-    const DANGLING_PTR: *mut NodeInner<K, V> = NonNull::dangling().as_ptr();
+impl<K, V, Logger> NodeInner<K, V, Logger> {
+    const DANGLING_PTR: *mut NodeInner<K, V, Logger> = NonNull::dangling().as_ptr();
 
-    pub(crate) fn root(&self) -> Option<&UnsafeNode<K, V>> {
+    pub(crate) fn root(&self) -> Option<&UnsafeNode<K, V, Logger>> {
         self.ancestors.as_ref().map(Ancestors::root)
     }
 }
