@@ -1,0 +1,12 @@
+[package]
+name = "recycling-tree"
+version = "0.1.0"
+authors = ["Anthony Ramine <nox@nox.paris>"]
+edition = "2018"
+
+[lib]
+test = false
+
+[dependencies]
+fxhash = "0.2.1"
+parking_lot = "0.10.2"
